@@ -1,0 +1,461 @@
+#property strict
+#property version   "1.10"
+#property description "Ichimoku M5 Gold Profit Mode (MT5-syntax correct)"
+
+//----------------------------------------------------
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//====================== Inputs ======================
+input double RiskPercent           = 1.0;
+
+input int    Tenkan                = 9;
+input int    Kijun                 = 26;
+input int    SenkouB               = 52;
+
+input int    SlippagePoints        = 30;
+input bool   OneTradePerSymbol     = true;
+input bool   RequireCloseSignal    = true;
+
+// --- Filters
+input bool   UseSpreadFilter       = true;
+input int    MaxSpreadPoints       = 60;
+
+input bool   UseATRFilter          = true;
+input int    ATRPeriod             = 14;
+input double MinATRPoints          = 150;
+
+input bool   UseSessionFilter      = true;
+input int    SessionStartHour      = 7;
+input int    SessionEndHour        = 21;
+
+// --- HTF Bias
+input bool            UseHTF1      = true;
+input ENUM_TIMEFRAMES HTF1         = PERIOD_M15;
+input bool            RequireHTF_TK= true;
+
+// --- Entry tuning
+input bool   UseCloudMid           = true;
+input bool   UseSoftSlope          = true;
+input bool   UseChikouSimple       = true;
+
+// --- Profit management
+input bool   UseTakeProfit         = false;
+input double FixedRR               = 2.0;
+
+input bool   UseBreakEven          = true;
+input double BE_R                  = 1.0;
+
+input bool   UsePartialClose       = true;
+input double Partial_R             = 1.5;
+input double PartialPct            = 0.50;
+
+input bool   UseTrailKijun         = true;
+
+//====================== Globals ======================
+int      ichiHandleTF   = INVALID_HANDLE;
+int      ichiHandleHTF  = INVALID_HANDLE;
+int      atrHandle      = INVALID_HANDLE;
+datetime lastBarTime    = 0;
+
+//====================== Helpers ======================
+double CloudTop(const double a, const double b) { return (a > b ? a : b); }
+double CloudBot(const double a, const double b) { return (a < b ? a : b); }
+
+bool HasPositionOnSymbol()
+{
+   if(!OneTradePerSymbol)
+      return (PositionsTotal() > 0);
+   return PositionSelect(_Symbol);
+}
+
+double StopsLevelPoints()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+}
+
+int VolumeDigits()
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) return 2;
+
+   for(int i=0; i<=8; i++)
+   {
+      double x = step * MathPow(10.0, i);
+      if(MathAbs(x - MathRound(x)) < 1e-9) return i;
+   }
+   return 2;
+}
+
+double GetPointValuePerLot()
+{
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_value <= 0 || tick_size <= 0) return 0.0;
+   return (tick_value / tick_size) * _Point; // value per 1 point
+}
+
+double CalcLotByRisk(const double sl_points)
+{
+   if(sl_points <= 0) return 0.0;
+
+   const double pv = GetPointValuePerLot();
+   if(pv <= 0) return 0.0;
+
+   const double risk_money = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent / 100.0);
+   const double lot_raw    = risk_money / (sl_points * pv);
+
+   const double vmin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double vmax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   const double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   double lot = MathMax(vmin, MathMin(vmax, lot_raw));
+   if(vstep > 0) lot = MathFloor(lot / vstep) * vstep;
+
+   return NormalizeDouble(lot, VolumeDigits());
+}
+
+bool IsNewBar()
+{
+   // در MT5 این تابع وجود دارد. اگر خطا گرفتی یعنی فایل/محیط اشتباه است.
+   datetime t = iTime(_Symbol, _Period, 0);
+   if(t != lastBarTime)
+   {
+      lastBarTime = t;
+      return true;
+   }
+   return false;
+}
+
+bool PassesSessionFilter()
+{
+   if(!UseSessionFilter) return true;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return true; // اگر تیک نبود، فیلتر رو رد نکن
+
+   MqlDateTime dt;
+   TimeToStruct((datetime)tick.time, dt); // tick.time = زمان سرور
+
+   int h = dt.hour;
+
+   if(SessionStartHour <= SessionEndHour)
+      return (h >= SessionStartHour && h <= SessionEndHour);
+
+   // اگر بازه از نیمه‌شب رد بشه
+   return (h >= SessionStartHour || h <= SessionEndHour);
+}
+
+bool PassesSpreadFilter()
+{
+   if(!UseSpreadFilter) return true;
+   int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   return (spread <= MaxSpreadPoints);
+}
+
+bool PassesATRFilter()
+{
+   if(!UseATRFilter) return true;
+   if(atrHandle == INVALID_HANDLE) return false;
+
+   double buf[1];
+   if(CopyBuffer(atrHandle, 0, 1, 1, buf) != 1) return false;
+
+   double atr = buf[0];
+   if(atr <= 0) return false;
+
+   double atr_points = atr / _Point;
+   return (atr_points >= MinATRPoints);
+}
+
+// Ichimoku reading with correct cloud shift:
+// Tenkan/Kijun from shiftSignal
+// SpanA/SpanB from shiftSignal + displacement (Kijun)
+bool GetIchiShifted(const int handle,
+                    const int shiftSignal,
+                    const int displacement,
+                    double &tenkan_now, double &tenkan_prev,
+                    double &kijun_now,  double &kijun_prev,
+                    double &spanA,      double &spanB)
+{
+   if(handle == INVALID_HANDLE) return false;
+
+   double t[2], k[2];
+   if(CopyBuffer(handle, 0, shiftSignal, 2, t) != 2) return false;
+   if(CopyBuffer(handle, 1, shiftSignal, 2, k) != 2) return false;
+
+   tenkan_now  = t[0];
+   tenkan_prev = t[1];
+   kijun_now   = k[0];
+   kijun_prev  = k[1];
+
+   int cloudShift = shiftSignal + displacement;
+   double a[1], b[1];
+   if(CopyBuffer(handle, 2, cloudShift, 1, a) != 1) return false;
+   if(CopyBuffer(handle, 3, cloudShift, 1, b) != 1) return false;
+
+   spanA = a[0];
+   spanB = b[0];
+   return true;
+}
+
+// Simple chikou: Close[shift] vs Close[shift + displacement]
+bool ChikouSimpleBuy(const ENUM_TIMEFRAMES tf, const int shiftSignal, const int displacement)
+{
+   double c      = iClose(_Symbol, tf, shiftSignal);
+   double c_back = iClose(_Symbol, tf, shiftSignal + displacement);
+   if(c <= 0 || c_back <= 0) return false;
+   return (c > c_back);
+}
+
+bool ChikouSimpleSell(const ENUM_TIMEFRAMES tf, const int shiftSignal, const int displacement)
+{
+   double c      = iClose(_Symbol, tf, shiftSignal);
+   double c_back = iClose(_Symbol, tf, shiftSignal + displacement);
+   if(c <= 0 || c_back <= 0) return false;
+   return (c < c_back);
+}
+
+// HTF bias: direction by TK state on HTF closed bar
+bool HTF_BuyOk()
+{
+   if(!UseHTF1) return true;
+   if(!RequireHTF_TK) return true;
+
+   double t0,t1,k0,k1,a0,b0;
+   if(!GetIchiShifted(ichiHandleHTF, 1, Kijun, t0,t1,k0,k1,a0,b0)) return false;
+   return (t0 > k0);
+}
+
+bool HTF_SellOk()
+{
+   if(!UseHTF1) return true;
+   if(!RequireHTF_TK) return true;
+
+   double t0,t1,k0,k1,a0,b0;
+   if(!GetIchiShifted(ichiHandleHTF, 1, Kijun, t0,t1,k0,k1,a0,b0)) return false;
+   return (t0 < k0);
+}
+
+//====================== Position Management ======================
+void ManagePosition()
+{
+   if(!PositionSelect(_Symbol)) return;
+
+   long   type  = (long)PositionGetInteger(POSITION_TYPE);
+   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl    = PositionGetDouble(POSITION_SL);
+   double vol   = PositionGetDouble(POSITION_VOLUME);
+
+   double price = (type == POSITION_TYPE_BUY) ?
+      SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+      SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(entry <= 0 || price <= 0) return;
+
+   double risk = MathAbs(entry - sl);
+   if(risk <= 0) return;
+
+   double r_now = MathAbs(price - entry) / risk;
+
+   // Break-even
+   if(UseBreakEven && r_now >= BE_R)
+   {
+      if(type == POSITION_TYPE_BUY && sl < entry)
+         trade.PositionModify(_Symbol, entry, 0);
+
+      if(type == POSITION_TYPE_SELL && (sl > entry || sl == 0))
+         trade.PositionModify(_Symbol, entry, 0);
+   }
+
+   // Partial close
+   if(UsePartialClose && r_now >= Partial_R)
+   {
+      double vmin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+      if(vol >= (vmin + vstep * 2.0))
+      {
+         double closeVol = vol * PartialPct;
+         closeVol = MathFloor(closeVol / vstep) * vstep;
+         closeVol = NormalizeDouble(closeVol, VolumeDigits());
+
+         if(closeVol >= vmin && closeVol < vol)
+            trade.PositionClose(_Symbol, closeVol); // پایدارتر از ClosePartial
+      }
+   }
+
+   // Trail by Kijun (main TF, closed bar)
+   if(UseTrailKijun)
+   {
+      double kij[1];
+      if(CopyBuffer(ichiHandleTF, 1, 1, 1, kij) == 1)
+      {
+         double trail = kij[0];
+         if(trail <= 0) return;
+
+         if(type == POSITION_TYPE_BUY)
+         {
+            if(trail > sl && trail < price)
+               trade.PositionModify(_Symbol, trail, 0);
+         }
+         else if(type == POSITION_TYPE_SELL)
+         {
+            if((sl == 0 || trail < sl) && trail > price)
+               trade.PositionModify(_Symbol, trail, 0);
+         }
+      }
+   }
+}
+
+//====================== MT5 Events ======================
+int OnInit()
+{
+   ichiHandleTF = iIchimoku(_Symbol, _Period, Tenkan, Kijun, SenkouB);
+   if(ichiHandleTF == INVALID_HANDLE) return INIT_FAILED;
+
+   if(UseHTF1)
+   {
+      ichiHandleHTF = iIchimoku(_Symbol, HTF1, Tenkan, Kijun, SenkouB);
+      if(ichiHandleHTF == INVALID_HANDLE) return INIT_FAILED;
+   }
+
+   atrHandle = iATR(_Symbol, _Period, ATRPeriod);
+   if(atrHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   trade.SetDeviationInPoints(SlippagePoints);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   if(ichiHandleTF  != INVALID_HANDLE) IndicatorRelease(ichiHandleTF);
+   if(ichiHandleHTF != INVALID_HANDLE) IndicatorRelease(ichiHandleHTF);
+   if(atrHandle     != INVALID_HANDLE) IndicatorRelease(atrHandle);
+}
+
+void OnTick()
+{
+   // always manage existing position first
+   ManagePosition();
+
+   // no new entry if already in position
+   if(HasPositionOnSymbol()) return;
+
+   // filters
+   if(!PassesSessionFilter()) return;
+   if(!PassesSpreadFilter())  return;
+   if(!PassesATRFilter())     return;
+
+   if(RequireCloseSignal)
+      if(!IsNewBar()) return;
+
+   if(Bars(_Symbol, _Period) < 300) return;
+   if(UseHTF1 && Bars(_Symbol, HTF1) < 300) return;
+
+   int signalShift = RequireCloseSignal ? 1 : 0;
+
+   // Read Ichimoku main TF
+   double tenkan0,tenkan1,kijun0,kijun1,spanA0,spanB0;
+   if(!GetIchiShifted(ichiHandleTF, signalShift, Kijun,
+                      tenkan0,tenkan1,kijun0,kijun1,spanA0,spanB0))
+      return;
+
+   double closeSig = iClose(_Symbol, _Period, signalShift);
+   if(closeSig <= 0) return;
+
+   // TK state
+   bool tkBull = (tenkan0 > kijun0);
+   bool tkBear = (tenkan0 < kijun0);
+
+   // slope
+   bool slopeUp, slopeDn;
+   if(UseSoftSlope)
+   {
+      slopeUp = (tenkan0 > tenkan1) || (kijun0 > kijun1);
+      slopeDn = (tenkan0 < tenkan1) || (kijun0 < kijun1);
+   }
+   else
+   {
+      slopeUp = (tenkan0 > tenkan1) && (kijun0 > kijun1);
+      slopeDn = (tenkan0 < tenkan1) && (kijun0 < kijun1);
+   }
+
+   // cloud reference
+   double top = CloudTop(spanA0, spanB0);
+   double bot = CloudBot(spanA0, spanB0);
+   double mid = (top + bot) / 2.0;
+
+   bool priceOkBuy, priceOkSell;
+   if(UseCloudMid)
+   {
+      priceOkBuy  = (closeSig > mid);
+      priceOkSell = (closeSig < mid);
+   }
+   else
+   {
+      priceOkBuy  = (closeSig > top);
+      priceOkSell = (closeSig < bot);
+   }
+
+   // chikou
+   bool chikouBuy  = true;
+   bool chikouSell = true;
+   if(UseChikouSimple)
+   {
+      chikouBuy  = ChikouSimpleBuy(_Period, signalShift, Kijun);
+      chikouSell = ChikouSimpleSell(_Period, signalShift, Kijun);
+   }
+
+   // HTF bias
+   bool htfBuyOk  = HTF_BuyOk();
+   bool htfSellOk = HTF_SellOk();
+
+   //====================== ENTRY ======================
+   // BUY
+   if(priceOkBuy && tkBull && slopeUp && chikouBuy && htfBuyOk)
+   {
+      double entry = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(entry <= 0) return;
+
+      double sl = bot;
+      double sl_points = MathAbs(entry - sl) / _Point;
+
+      double minStops = StopsLevelPoints();
+      if(sl_points < (minStops + 2.0)) return;
+
+      double lot = CalcLotByRisk(sl_points);
+      if(lot <= 0) return;
+
+      double tp = 0.0;
+      if(UseTakeProfit)
+         tp = entry + (entry - sl) * FixedRR;
+
+      trade.Buy(lot, _Symbol, entry, sl, tp, "IchiGoldM5 BUY");
+      return;
+   }
+
+   // SELL
+   if(priceOkSell && tkBear && slopeDn && chikouSell && htfSellOk)
+   {
+      double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(entry <= 0) return;
+
+      double sl = top;
+      double sl_points = MathAbs(sl - entry) / _Point;
+
+      double minStops = StopsLevelPoints();
+      if(sl_points < (minStops + 2.0)) return;
+
+      double lot = CalcLotByRisk(sl_points);
+      if(lot <= 0) return;
+
+      double tp = 0.0;
+      if(UseTakeProfit)
+         tp = entry - (sl - entry) * FixedRR;
+
+      trade.Sell(lot, _Symbol, entry, sl, tp, "IchiGoldM5 SELL");
+      return;
+   }
+}
